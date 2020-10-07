@@ -21,6 +21,11 @@ public suspend fun ByteReadChannel.readUntilDelimiter(delimiter: ByteBuffer, dst
     var copied = 0
     var endFound = false
 
+    while (!isClosedForRead && !endFound && dst.hasRemaining()) {
+        read {
+        }
+    }
+
     lookAhead {
         do {
             val rc = tryCopyUntilDelimiter(delimiter, dst)
@@ -38,24 +43,35 @@ public suspend fun ByteReadChannel.readUntilDelimiter(delimiter: ByteBuffer, dst
     else readUntilDelimiterSuspend(delimiter, dst, copied)
 }
 
+/**
+ * Skip all bytes until [delimiter] in the current channel. The [delimiter] will also be skipped.
+ *
+ * @throws IOException if the delimiter isn't't found.
+ */
 public suspend fun ByteReadChannel.skipDelimiter(delimiter: ByteBuffer) {
     require(delimiter.hasRemaining())
 
     var found = false
 
-    lookAhead {
-        found = tryEnsureDelimiter(delimiter) == delimiter.remaining()
+    var offset = delimiter.position()
+    while (!found && !isClosedForRead) {
+        read {
+            while (!it.isEmpty() && offset < delimiter.limit()) {
+                val matches = it.get() == delimiter[offset]
+
+                if (matches) {
+                    offset += 1
+                } else {
+                    offset = delimiter.position()
+                }
+            }
+
+            found = offset == delimiter.limit()
+        }
     }
 
     if (!found) {
-        skipDelimiterSuspend(delimiter)
-    }
-}
-
-private suspend fun ByteReadChannel.skipDelimiterSuspend(delimiter: ByteBuffer) {
-    lookAheadSuspend {
-        awaitAtLeast(delimiter.remaining())
-        if (tryEnsureDelimiter(delimiter) != delimiter.remaining()) throw IOException("Broken delimiter occurred")
+        throw IOException("Broken delimiter occured")
     }
 }
 
@@ -137,15 +153,6 @@ private fun LookAheadSession.tryCopyUntilDelimiter(delimiter: ByteBuffer, dst: B
     consumed(size)
 
     return if (endFound) -size else size
-}
-
-private fun LookAheadSession.tryEnsureDelimiter(delimiter: ByteBuffer): Int {
-    val found = startsWithDelimiter(delimiter)
-    if (found == -1) throw IOException("Failed to skip delimiter: actual bytes differ from delimiter bytes")
-    if (found < delimiter.remaining()) return found
-
-    consumed(delimiter.remaining())
-    return delimiter.remaining()
 }
 
 /**
