@@ -4,6 +4,7 @@ apply plugin: 'maven-publish'
 apply from: project.rootProject.file('gradle/pom.gradle')
 
 task emptyJar(type: Jar) {
+    archiveAppendix.set("empty")
 }
 
 def selectArtifactId(project, type, defaultName) {
