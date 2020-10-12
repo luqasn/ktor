@@ -21,6 +21,8 @@ import io.ktor.utils.io.*
 import io.ktor.utils.io.jvm.javaio.*
 import io.ktor.utils.io.streams.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.*
+import kotlinx.coroutines.flow.*
 import org.junit.runners.model.*
 import org.slf4j.*
 import java.io.*
@@ -531,7 +533,102 @@ public abstract class SustainabilityTestSuite<TEngine : ApplicationEngine, TConf
                 "HTTP/1.0 400"
             )
 
-            assertTrue(expected.any { result.startsWith(it) },"Invalid response: $result")
+            assertTrue(expected.any { result.startsWith(it) }, "Invalid response: $result")
+        }
+    }
+
+    @Test
+    @NoHttp2
+    fun testStuckBlockingWorker() {
+        val completed = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+
+        val train = async(start = CoroutineStart.LAZY) {
+            repeat(2000) {
+                launch {
+                    withUrl("/ok") {
+                        assertEquals("ok", readText())
+                    }
+                }.invokeOnCompletion {
+                    completed.incrementAndGet()
+                    if (it != null) {
+                        failed.incrementAndGet()
+                    }
+                }
+            }
+        }
+
+        launch {
+            var lastCompleted = -1
+            var lastFailed = -1
+
+            do {
+                delay(1000L)
+                val completedNow = completed.get()
+                val failedNow = failed.get()
+
+                if (lastCompleted != completedNow || lastFailed != failedNow) {
+                    println("Completed: $completedNow, failed: $failedNow")
+                    lastCompleted = completedNow
+                    lastFailed = failedNow
+                }
+            } while (!train.isCompleted)
+        }
+
+        createAndStartServer {
+            post("/") {
+                println("Long request started!")
+                train.start()
+
+                val stream = call.receive<InputStream>()
+
+                val ctx = currentCoroutineContext()
+
+                @Suppress("BlockingMethodInNonBlockingContext")
+                val array = stream.readAllBytes()
+//                val array = call.receive<ByteArray>()
+
+                println("Received ${array.size} bytes. ctx = $ctx")
+
+                yield()
+
+                call.respondText("Array of size ${array.size} received.")
+            }
+            get("/ok") {
+                call.respondText {
+                    delay(50)
+                    "ok"
+                }
+            }
+        }
+
+        runBlocking {
+            socket {
+                getOutputStream().writePacket(RequestResponseBuilder().apply {
+                    requestLine(HttpMethod.Post, "/", "HTTP/1.1")
+                    headerLine(HttpHeaders.Host, "localhost:$port")
+                    headerLine(HttpHeaders.ContentType, ContentType.Text.Plain.toString())
+                    headerLine(HttpHeaders.ContentLength, "10")
+                    headerLine(HttpHeaders.Connection, ConnectionOptions.Close.toString())
+                    emptyLine()
+                }.build())
+                getOutputStream().flush()
+
+                // train.join() does start while we want it to be started in the request handler
+                val a = CompletableDeferred<Unit>()
+                train.invokeOnCompletion {
+                    a.complete(Unit)
+                }
+                a.await()
+
+                println("Sending 10 bytes")
+                getOutputStream().write("0123456789\r\n".encodeToByteArray())
+                getOutputStream().flush()
+
+                println("Waiting for response...")
+                getInputStream().readAllBytes()
+                println("Got response")
+            }
         }
     }
 }
